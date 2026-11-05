@@ -8,6 +8,7 @@ This is similar in concept to the `asyncio` module.
 import asyncio
 import contextlib
 from asyncio import FIRST_COMPLETED, AbstractEventLoop, Future, Task
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from functools import partial
@@ -70,20 +71,27 @@ def make_async_with_semaphore(
 def make_async_batched(
     func: Callable[P, T],
     executor: Executor,
-    max_batch_size: int = 256,
 ) -> Callable[P, Future[T]]:
-    """Like `make_async`, but the calls made in one event loop iteration are
-    submitted as one executor job per worker.
+    """Like `make_async`, but the calls made in one event loop iteration share
+    at most one executor job per worker.
 
     Submitting a job costs the event loop about as much as a small call, such
-    as rendering a short prompt. Grouping the calls pays that cost once per job.
-    Nothing waits for more calls: a single call is submitted on the next loop
-    iteration, and each result is handed back as soon as its call finishes.
+    as rendering a short prompt. The jobs drain a shared queue of the calls,
+    each taking the next call when it is free, so long and short calls spread
+    over the workers as they do with one job per call. Nothing waits for more
+    calls: a single call is submitted on the next loop iteration, and each
+    result is handed back as soon as its call finishes.
     """
-    pending: dict[AbstractEventLoop, list[tuple[Future[T], Callable[[], T]]]] = {}
+    pending: dict[AbstractEventLoop, deque[tuple[Future[T], Callable[[], T]]]] = {}
 
-    def _run(loop: AbstractEventLoop, calls: list[tuple[Future[T], Callable[[], T]]]):
-        for fut, call in calls:
+    def _drain(
+        loop: AbstractEventLoop, calls: deque[tuple[Future[T], Callable[[], T]]]
+    ):
+        while True:
+            try:
+                fut, call = calls.popleft()
+            except IndexError:
+                return
             if fut.cancelled():
                 continue
             try:
@@ -100,13 +108,16 @@ def make_async_batched(
     def _flush(loop: AbstractEventLoop):
         calls = pending.pop(loop)
         num_workers = max(1, getattr(executor, "_max_workers", 1))
-        size = min(max_batch_size, (len(calls) + num_workers - 1) // num_workers)
-        for start in range(0, len(calls), size):
-            chunk = calls[start : start + size]
+        for _ in range(min(num_workers, len(calls))):
             try:
-                executor.submit(_run, loop, chunk)
+                executor.submit(_drain, loop, calls)
             except RuntimeError as e:  # The executor is shut down.
-                for fut, _ in chunk:
+                # Fail the calls that no submitted job has taken yet.
+                while True:
+                    try:
+                        fut, _ = calls.popleft()
+                    except IndexError:
+                        return
                     _set_future_result(fut, None, e)
 
     def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Future[T]:
@@ -114,7 +125,7 @@ def make_async_batched(
         fut = loop.create_future()
         calls = pending.get(loop)
         if calls is None:
-            calls = pending[loop] = []
+            calls = pending[loop] = deque()
             loop.call_soon(_flush, loop)
         calls.append((fut, partial(func, *args, **kwargs)))
         return fut

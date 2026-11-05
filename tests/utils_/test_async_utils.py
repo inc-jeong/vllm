@@ -78,17 +78,40 @@ class _CountingExecutor(ThreadPoolExecutor):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("max_workers", "max_batch_size", "num_jobs"),
-    [(1, 256, 1), (1, 32, 4), (4, 256, 4)],
+    ("max_workers", "num_calls", "num_jobs"),
+    [(1, 100, 1), (4, 100, 4), (8, 3, 3)],
 )
-async def test_make_async_batched_groups_calls(max_workers, max_batch_size, num_jobs):
-    # Calls made in one loop iteration share jobs, split across the workers.
+async def test_make_async_batched_groups_calls(max_workers, num_calls, num_jobs):
+    # Calls made in one loop iteration share at most one job per worker.
     with _CountingExecutor(max_workers) as executor:
-        square = make_async_batched(lambda x: x * x, executor, max_batch_size)
-        assert await asyncio.gather(*[square(i) for i in range(100)]) == [
-            i * i for i in range(100)
+        square = make_async_batched(lambda x: x * x, executor)
+        assert await asyncio.gather(*[square(i) for i in range(num_calls)]) == [
+            i * i for i in range(num_calls)
         ]
         assert executor.num_jobs == num_jobs
+
+
+@pytest.mark.asyncio
+async def test_make_async_batched_spreads_calls_over_free_workers():
+    release = threading.Event()
+
+    def wait_for_release(block: bool) -> bool:
+        if block:
+            release.wait(timeout=10)
+        return block
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        call = make_async_batched(wait_for_release, executor)
+        try:
+            blocked = call(True)
+            others = [call(False) for _ in range(3)]
+            # The free worker runs every later call while the first one blocks.
+            done = await asyncio.wait_for(asyncio.gather(*others), timeout=5)
+            assert done == [False] * 3
+            assert not blocked.done()
+        finally:
+            release.set()
+        assert await blocked is True
 
 
 @pytest.mark.asyncio
